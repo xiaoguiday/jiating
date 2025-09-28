@@ -33,34 +33,28 @@ sudo tee /usr/local/bin/wss > /dev/null <<'EOF'
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import sys
 import asyncio, ssl
 
 LISTEN_ADDR = '0.0.0.0'
+HTTP_PORT = 80        # 修改为你的 HTTP 端口
+TLS_PORT = 443        # 修改为你的 TLS 端口
+DEFAULT_TARGET = ('127.0.0.1', 22)
 BUFFER_SIZE = 65536
 TIMEOUT = 60
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
 KEY_FILE = '/etc/stunnel/certs/stunnel.key'
 PASS = ''  # 如果需要密码验证，可填
-DEFAULT_TARGET = ('127.0.0.1', 22)
 
 FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK'
 SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
 
-# 接收命令行参数
-if len(sys.argv) >= 3:
-    HTTP_PORT = int(sys.argv[1])
-    TLS_PORT = int(sys.argv[2])
-else:
-    HTTP_PORT = 80
-    TLS_PORT = 443
-
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
     print(f"Connection from {peer} {'(TLS)' if tls else ''}")
-    forwarding_started = False
+    forwarding_started = False  # 是否进入转发阶段
 
     try:
+        # 循环处理客户端发送的 payload
         while True:
             data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
             if not data:
@@ -75,24 +69,30 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 if line.startswith('X-Pass:'):
                     passwd_header = line.split(':', 1)[1].strip()
 
+            # 密码验证
             if PASS and passwd_header != PASS:
                 writer.write(b'HTTP/1.1 400 WrongPass!\r\n\r\n')
                 await writer.drain()
                 break
 
+            # 检查是否触发转发
             if not forwarding_started:
                 if 'GET-RAY' in headers:
+                    # 第一段就触发转发
                     writer.write(SWITCH_RESPONSE)
                     await writer.drain()
                     forwarding_started = True
                 else:
+                    # 返回200并继续等待下一段 payload
                     writer.write(FIRST_RESPONSE)
                     await writer.drain()
-                    continue
+                    continue  # 等待下一次 payload
             else:
+                # 已经触发转发，直接转发数据
                 writer.write(SWITCH_RESPONSE)
                 await writer.drain()
             
+            # 解析目标
             if host_header:
                 if ':' in host_header:
                     host, port = host_header.split(':')
@@ -102,6 +102,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             else:
                 target = DEFAULT_TARGET
 
+            # ==== 连接目标服务器 ====
             target_reader, target_writer = await asyncio.open_connection(*target)
 
             async def pipe(src_reader, dst_writer):
@@ -121,7 +122,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 pipe(reader, target_writer),
                 pipe(target_reader, writer)
             )
-            break
+            break  # 转发完成后退出循环
 
     except Exception as e:
         print(f"Connection error {peer}: {e}")
@@ -132,6 +133,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 async def main():
+    # TLS server
     ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
 
@@ -142,6 +144,7 @@ async def main():
         ssl=ssl_ctx
     )
 
+    # HTTP server
     http_server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, tls=False),
         LISTEN_ADDR,
@@ -159,6 +162,7 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
+
 EOF
 
 sudo chmod +x /usr/local/bin/wss
