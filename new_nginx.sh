@@ -13,9 +13,6 @@ STUNNEL_PORT=${STUNNEL_PORT:-444}
 read -p "请输入 UDPGW 端口（默认7300）: " UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
 
-read -p "请输入 Nginx 域名（如 example.com）: " DOMAIN
-DOMAIN=${DOMAIN:-example.com}
-
 # =============================
 # 系统更新与依赖
 # =============================
@@ -33,196 +30,136 @@ sudo tee /usr/local/bin/wss > /dev/null <<'EOF'
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import socket, threading, select, sys, time
+import asyncio, ssl
 
-LISTENING_ADDR = '0.0.0.0'
-LISTENING_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
-PASS = ''
-BUFLEN = 4096 * 4
-HEARTBEAT_INTERVAL = 300
-HEARTBEAT_MAX_FAIL = 3
-DEFAULT_HOST = '127.0.0.1:22'
+LISTEN_ADDR = '0.0.0.0'
+HTTP_PORT = 880        # 修改为你的 HTTP 端口
+TLS_PORT = 8443        # 修改为你的 TLS 端口
+DEFAULT_TARGET = ('127.0.0.1', 22)
+BUFFER_SIZE = 65536
+TIMEOUT = 60
+CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
+KEY_FILE = '/etc/stunnel/certs/stunnel.key'
+PASS = ''  # 如果需要密码验证，可填
 
-FIRST_RESPONSE = (
-    "HTTP/1.1 302 Found\r\n"
-    "Location: /\r\n"
-    "Content-Length: 0\r\n"
-    "Connection: keep-alive\r\n"
-    "\r\n"
-)
+FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK'
+SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
 
-SWITCH_RESPONSE = (
-    "HTTP/1.1 101 Switching Protocols\r\n"
-    "Upgrade: websocket\r\n"
-    "Connection: Upgrade\r\n"
-    "\r\n"
-)
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
+    peer = writer.get_extra_info('peername')
+    print(f"Connection from {peer} {'(TLS)' if tls else ''}")
+    forwarding_started = False  # 是否进入转发阶段
 
-class Server(threading.Thread):
-    def __init__(self, host, port):
-        super().__init__()
-        self.host = host
-        self.port = port
-        self.running = False
-        self.threads = []
-        self.lock = threading.Lock()
-
-    def run(self):
-        self.soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.soc.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.soc.bind((self.host, self.port))
-        self.soc.listen(5)
-        self.running = True
-        try:
-            while self.running:
-                try:
-                    c, addr = self.soc.accept()
-                    c.setblocking(1)
-                    conn = ConnectionHandler(c, self, addr)
-                    conn.start()
-                    self.addConn(conn)
-                except Exception:
-                    continue
-        finally:
-            self.soc.close()
-            self.running = False
-
-    def addConn(self, conn):
-        with self.lock:
-            self.threads.append(conn)
-
-    def removeConn(self, conn):
-        with self.lock:
-            if conn in self.threads:
-                self.threads.remove(conn)
-
-    def printLog(self, msg):
-        with self.lock:
-            print(msg)
-
-class ConnectionHandler(threading.Thread):
-    def __init__(self, client, server, addr):
-        super().__init__()
-        self.client = client
-        self.server = server
-        self.addr = addr
-        self.clientClosed = False
-        self.targetClosed = True
-        self.target = None
-        self.last_heartbeat = time.time()
-        self.heartbeat_fail = 0
-        self.log = f'Connection {addr}'
-
-    def close(self):
-        for sock in [self.client, self.target]:
-            if sock:
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                    sock.close()
-                except:
-                    pass
-        self.clientClosed = True
-        self.targetClosed = True
-
-    def run(self):
-        try:
-            self.server.printLog(self.log)
-            first_payload = self.client.recv(BUFLEN)
-            hostPort = self.findHeader(first_payload, 'X-Real-Host') or DEFAULT_HOST
-            passwd = self.findHeader(first_payload, 'X-Pass')
-            if PASS and passwd != PASS:
-                self.client.send(b'HTTP/1.1 400 WrongPass\r\n\r\n')
-                return
-            self.client.sendall(FIRST_RESPONSE.encode())
-
-            while True:
-                payload = self.client.recv(BUFLEN)
-                if not payload:
-                    return
-                if b'GET-RAY' in payload:
-                    self.client.sendall(SWITCH_RESPONSE.encode())
-                    break
-
-            self.method_CONNECT(hostPort)
-        except Exception as e:
-            self.server.printLog(f'{self.log} - error: {e}')
-        finally:
-            self.close()
-            self.server.removeConn(self)
-
-    def findHeader(self, head, header):
-        if isinstance(head, bytes):
-            head = head.decode(errors='ignore')
-        idx = head.find(header + ': ')
-        if idx == -1:
-            return ''
-        idx2 = head.find('\r\n', idx)
-        if idx2 == -1:
-            return ''
-        return head[idx+len(header)+2:idx2].strip()
-
-    def connect_target(self, host):
-        if ':' in host:
-            h, p = host.split(':')
-            port = int(p)
-            host = h
-        else:
-            port = 22
-        self.target = socket.create_connection((host, port))
-        self.targetClosed = False
-
-    def method_CONNECT(self, hostPort):
-        self.server.printLog(f'{self.log} - CONNECT {hostPort}')
-        self.connect_target(hostPort)
-        self.forward_loop()
-
-    def forward_loop(self):
-        socs = [self.client, self.target]
-        while True:
-            try:
-                recv, _, err = select.select(socs, [], socs, 1)
-            except:
-                break
-            if err:
-                break
-            now = time.time()
-            if now - self.last_heartbeat >= HEARTBEAT_INTERVAL:
-                try:
-                    self.client.send(b'')
-                    self.last_heartbeat = now
-                    self.heartbeat_fail = 0
-                except:
-                    self.heartbeat_fail += 1
-                    if self.heartbeat_fail >= HEARTBEAT_MAX_FAIL:
-                        self.server.printLog(f'{self.log} - heartbeat failed, closing')
-                        break
-            for s in recv:
-                try:
-                    data = s.recv(BUFLEN)
-                    if not data:
-                        return
-                    if s is self.target:
-                        self.client.sendall(data)
-                    else:
-                        total = data
-                        while total:
-                            sent = self.target.send(total)
-                            total = total[sent:]
-                except:
-                    return
-
-def main():
-    print(f"WSS Python Proxy listening on {LISTENING_ADDR}:{LISTENING_PORT}")
-    server = Server(LISTENING_ADDR, LISTENING_PORT)
-    server.start()
     try:
+        # 循环处理客户端发送的 payload
         while True:
-            time.sleep(2)
-    except KeyboardInterrupt:
-        server.close()
+            data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
+            if not data:
+                break
+
+            headers = data.decode(errors='ignore')
+            host_header = ''
+            passwd_header = ''
+            for line in headers.split('\r\n'):
+                if line.startswith('X-Real-Host:'):
+                    host_header = line.split(':', 1)[1].strip()
+                if line.startswith('X-Pass:'):
+                    passwd_header = line.split(':', 1)[1].strip()
+
+            # 密码验证
+            if PASS and passwd_header != PASS:
+                writer.write(b'HTTP/1.1 400 WrongPass!\r\n\r\n')
+                await writer.drain()
+                break
+
+            # 检查是否触发转发
+            if not forwarding_started:
+                if 'GET-RAY' in headers:
+                    # 第一段就触发转发
+                    writer.write(SWITCH_RESPONSE)
+                    await writer.drain()
+                    forwarding_started = True
+                else:
+                    # 返回200并继续等待下一段 payload
+                    writer.write(FIRST_RESPONSE)
+                    await writer.drain()
+                    continue  # 等待下一次 payload
+            else:
+                # 已经触发转发，直接转发数据
+                writer.write(SWITCH_RESPONSE)
+                await writer.drain()
+            
+            # 解析目标
+            if host_header:
+                if ':' in host_header:
+                    host, port = host_header.split(':')
+                    target = (host.strip(), int(port.strip()))
+                else:
+                    target = (host_header.strip(), 22)
+            else:
+                target = DEFAULT_TARGET
+
+            # ==== 连接目标服务器 ====
+            target_reader, target_writer = await asyncio.open_connection(*target)
+
+            async def pipe(src_reader, dst_writer):
+                try:
+                    while True:
+                        buf = await src_reader.read(BUFFER_SIZE)
+                        if not buf:
+                            break
+                        dst_writer.write(buf)
+                        await dst_writer.drain()
+                except Exception:
+                    pass
+                finally:
+                    dst_writer.close()
+
+            await asyncio.gather(
+                pipe(reader, target_writer),
+                pipe(target_reader, writer)
+            )
+            break  # 转发完成后退出循环
+
+    except Exception as e:
+        print(f"Connection error {peer}: {e}")
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        print(f"Closed {peer}")
+
+
+async def main():
+    # TLS server
+    ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
+
+    tls_server = await asyncio.start_server(
+        lambda r, w: handle_client(r, w, tls=True),
+        LISTEN_ADDR,
+        TLS_PORT,
+        ssl=ssl_ctx
+    )
+
+    # HTTP server
+    http_server = await asyncio.start_server(
+        lambda r, w: handle_client(r, w, tls=False),
+        LISTEN_ADDR,
+        HTTP_PORT
+    )
+
+    print(f"Listening on {LISTEN_ADDR}:{HTTP_PORT} (HTTP payload)")
+    print(f"Listening on {LISTEN_ADDR}:{TLS_PORT} (TLS)")
+
+    async with tls_server, http_server:
+        await asyncio.gather(
+            tls_server.serve_forever(),
+            http_server.serve_forever()
+        )
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
+
 EOF
 
 sudo chmod +x /usr/local/bin/wss
@@ -318,53 +255,6 @@ sudo systemctl enable udpgw
 sudo systemctl start udpgw
 echo "UDPGW 已启动，端口 $UDPGW_PORT"
 echo "----------------------------------"
-
-# =============================
-# 配置 Nginx
-# =============================
-sudo tee /etc/nginx/sites-available/$DOMAIN > /dev/null <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-
-    location / {
-        proxy_pass http://127.0.0.1:$WSS_PORT;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    }
-}
-
-server {
-    listen 443 ssl;
-    server_name $DOMAIN;
-
-    ssl_certificate /etc/stunnel/certs/stunnel.crt;
-    ssl_certificate_key /etc/stunnel/certs/stunnel.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-
-    location / {
-        proxy_pass http://127.0.0.1:$STUNNEL_PORT;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    }
-}
-EOF
-
-sudo ln -sf /etc/nginx/sites-available/$DOMAIN /etc/nginx/sites-enabled/
-sudo nginx -t
-sudo systemctl restart nginx
-echo "Nginx 已配置完成，80转发WSS($WSS_PORT)，443转发Stunnel4($STUNNEL_PORT)"
-echo "----------------------------------"
-
 echo "部署完成！"
 echo "查看 WSS 状态: sudo systemctl status wss"
 echo "查看 Stunnel4 状态: sudo systemctl status stunnel4"
