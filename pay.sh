@@ -33,8 +33,8 @@ sudo tee /usr/local/bin/wss > /dev/null <<'EOF'
 import asyncio, ssl
 
 LISTEN_ADDR = '0.0.0.0'
-HTTP_PORT = 880        # 修改为你的 HTTP 端口
-TLS_PORT = 8443        # 修改为你的 TLS 端口
+HTTP_PORT = 80        # 修改为你的 HTTP 端口
+TLS_PORT = 443        # 修改为你的 TLS 端口
 DEFAULT_TARGET = ('127.0.0.1', 22)
 BUFFER_SIZE = 65536
 TIMEOUT = 60
