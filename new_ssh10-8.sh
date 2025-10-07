@@ -1,6 +1,7 @@
 #!/bin/bash
 set -e
-#2025-10-08-06-55
+#2025-10-08-06-58
+
 # =============================
 # 提示端口
 # =============================
@@ -363,7 +364,7 @@ echo "WSS 已启动，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
 echo "----------------------------------"
 
 # =============================
-# 安装 Stunnel4 并生成证书
+# 安装 Stunnel4 并生成证书（global 配置方式）
 # =============================
 echo "==== 安装 Stunnel4 ===="
 sudo mkdir -p /etc/stunnel/certs
@@ -378,8 +379,7 @@ fi
 sudo chmod 600 /etc/stunnel/certs/stunnel.pem /etc/stunnel/certs/stunnel.key
 sudo chown root:root /etc/stunnel/certs/stunnel.pem /etc/stunnel/certs/stunnel.key
 
-# 创建 Stunnel4 配置文件
-sudo tee /etc/stunnel/stunnel-wss.conf > /dev/null <<EOF
+sudo tee /etc/stunnel/stunnel.conf > /dev/null <<EOF
 pid = /var/run/stunnel4.pid
 client = no
 foreground = no
@@ -395,10 +395,8 @@ accept = $STUNNEL_PORT
 connect = 127.0.0.1:22
 EOF
 
-# 启动 Stunnel4
-sudo systemctl daemon-reload
-sudo systemctl enable stunnel4@ssh-tls-gateway
-sudo systemctl restart stunnel4@ssh-tls-gateway
+sudo systemctl enable stunnel4
+sudo systemctl restart stunnel4
 echo "Stunnel4 已启动，监听端口 $STUNNEL_PORT -> 22"
 echo "----------------------------------"
 
@@ -408,18 +406,17 @@ echo "----------------------------------"
 echo "==== 安装 UDPGW (Badvpn) ===="
 sudo mkdir -p /root/badvpn
 cd /root/badvpn
-if [ ! -d ".git" ]; then
-    git clone https://github.com/ambrop72/badvpn.git .
-else
-    git reset --hard
-    git pull
+if [ ! -f /usr/local/bin/badvpn-udpgw ]; then
+    if [ ! -d badvpn ]; then
+        git clone https://github.com/ambrop72/badvpn.git
+    fi
+    cd badvpn
+    mkdir -p build
+    cd build
+    cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1
+    make -j$(nproc)
+    sudo cp udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
 fi
-
-mkdir -p build
-cd build
-cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1
-make -j$(nproc)
-sudo cp udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
 
 sudo tee /etc/systemd/system/udpgw.service > /dev/null <<EOF
 [Unit]
