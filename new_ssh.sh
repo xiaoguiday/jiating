@@ -33,109 +33,196 @@ sudo tee /usr/local/bin/wss > /dev/null <<'EOF'
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import asyncio, ssl
+import asyncio
+import socket
+import ssl
+import re
+import time
 
+# ================= 配置 =================
 LISTEN_ADDR = '0.0.0.0'
-HTTP_PORT = 80        # 修改为你的 HTTP 端口
-TLS_PORT = 443        # 修改为你的 TLS 端口
-DEFAULT_TARGET = ('127.0.0.1', 22)
+HTTP_PORT = 80
+TLS_PORT = 443
+DEFAULT_TARGET = ('127.0.0.1', 22)  # 转发目标
 BUFFER_SIZE = 65536
-TIMEOUT = 60
+TIMEOUT = 300
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
 KEY_FILE = '/etc/stunnel/certs/stunnel.key'
-PASS = ''  # 如果需要密码验证，可填
+HEARTBEAT_INTERVAL = 5  # 秒
+PASS = ''  # 如需要密码，可填
 
+# 响应内容
 FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK'
 SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
+FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'
 
+# 活动连接管理
+ACTIVE_CONNS = {}
+
+# ---------------- TCP 优化 ----------------
+def set_socket_options(writer: asyncio.StreamWriter):
+    sock = writer.get_extra_info('socket')
+    if sock:
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except Exception:
+            pass
+
+# ---------------- 读取 HTTP Header ----------------
+async def read_until_headers(reader: asyncio.StreamReader, initial_chunk: bytes = b''):
+    data = bytearray(initial_chunk)
+    while True:
+        if b'\r\n\r\n' in data:
+            headers, rest = data.split(b'\r\n\r\n', 1)
+            return bytes(headers), bytes(rest)
+        chunk = await reader.read(4096)
+        if not chunk:
+            return bytes(data), b''
+        data.extend(chunk)
+        if len(data) > 64 * 1024:
+            return bytes(data), b''
+
+# ---------------- 双向转发 ----------------
+async def pipe(src_reader: asyncio.StreamReader, dst_writer: asyncio.StreamWriter, conn_id):
+    try:
+        while True:
+            buf = await src_reader.read(BUFFER_SIZE)
+            if not buf:
+                break
+            dst_writer.write(buf)
+            await dst_writer.drain()
+            ACTIVE_CONNS[conn_id]['last_active'] = time.time()
+    except Exception:
+        pass
+    finally:
+        try:
+            dst_writer.close()
+            await dst_writer.wait_closed()
+        except Exception:
+            pass
+
+# ---------------- 处理客户端 ----------------
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
-    print(f"Connection from {peer} {'(TLS)' if tls else ''}")
-    forwarding_started = False  # 是否进入转发阶段
+    conn_id = f"{peer}-{time.time()}"
+    ACTIVE_CONNS[conn_id] = {'writer': writer, 'last_active': time.time()}
+    set_socket_options(writer)
+    print(f"[+] Connection from {peer} {'(TLS)' if tls else ''}")
 
     try:
-        # 循环处理客户端发送的 payload
-        while True:
-            data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
-            if not data:
+        while True:  # 循环处理多次 payload
+            first_chunk = await reader.read(4096)
+            if not first_chunk:
                 break
 
-            headers = data.decode(errors='ignore')
+            headers_bytes, rest = await read_until_headers(reader, first_chunk)
+            headers_text = headers_bytes.decode(errors='ignore')
+
+            # 解析 X-Real-Host、X-Pass、User-Agent
             host_header = ''
             passwd_header = ''
-            for line in headers.split('\r\n'):
-                if line.startswith('X-Real-Host:'):
+            for line in headers_text.split('\r\n'):
+                if line.lower().startswith('x-real-host:'):
                     host_header = line.split(':', 1)[1].strip()
-                if line.startswith('X-Pass:'):
+                if line.lower().startswith('x-pass:'):
                     passwd_header = line.split(':', 1)[1].strip()
 
-            # 密码验证
             if PASS and passwd_header != PASS:
                 writer.write(b'HTTP/1.1 400 WrongPass!\r\n\r\n')
                 await writer.drain()
                 break
 
-            # 检查是否触发转发
-            if not forwarding_started:
-                if 'GET-RAY' in headers:
-                    # 第一段就触发转发
-                    writer.write(SWITCH_RESPONSE)
-                    await writer.drain()
-                    forwarding_started = True
-                else:
-                    # 返回200并继续等待下一段 payload
-                    writer.write(FIRST_RESPONSE)
-                    await writer.drain()
-                    continue  # 等待下一次 payload
-            else:
-                # 已经触发转发，直接转发数据
+            ua_match = re.search(r'User-Agent:\s*(.+)', headers_text, re.IGNORECASE)
+            ua_value = ua_match.group(1).strip() if ua_match else ""
+
+            # ---------------- 处理 UA ----------------
+            if "26.4.0" in ua_value:
+                # 建立双向转发
                 writer.write(SWITCH_RESPONSE)
                 await writer.drain()
-            
-            # 解析目标
-            if host_header:
-                if ':' in host_header:
-                    host, port = host_header.split(':')
-                    target = (host.strip(), int(port.strip()))
+
+                # 解析目标
+                if host_header:
+                    if ':' in host_header:
+                        host, port = host_header.split(':', 1)
+                        target = (host.strip(), int(port.strip()))
+                    else:
+                        target = (host_header.strip(), 22)
                 else:
-                    target = (host_header.strip(), 22)
-            else:
-                target = DEFAULT_TARGET
+                    target = DEFAULT_TARGET
 
-            # ==== 连接目标服务器 ====
-            target_reader, target_writer = await asyncio.open_connection(*target)
-
-            async def pipe(src_reader, dst_writer):
+                # 连接目标
                 try:
-                    while True:
-                        buf = await src_reader.read(BUFFER_SIZE)
-                        if not buf:
-                            break
-                        dst_writer.write(buf)
-                        await dst_writer.drain()
-                except Exception:
-                    pass
-                finally:
-                    dst_writer.close()
+                    target_reader, target_writer = await asyncio.open_connection(*target)
+                    set_socket_options(target_writer)
+                except Exception as e:
+                    print(f"[!] Failed to connect target {target}: {e}")
+                    writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    await writer.drain()
+                    break
 
-            await asyncio.gather(
-                pipe(reader, target_writer),
-                pipe(target_reader, writer)
-            )
-            break  # 转发完成后退出循环
+                # 如果有剩余数据，先发给目标
+                if rest:
+                    target_writer.write(rest)
+                    await target_writer.drain()
+
+                # 双向转发
+                t1 = asyncio.create_task(pipe(reader, target_writer, conn_id))
+                t2 = asyncio.create_task(pipe(target_reader, writer, conn_id))
+                done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+                for p in pending:
+                    p.cancel()
+                    try:
+                        await p
+                    except:
+                        pass
+                break  # 转发后退出循环，连接交给 pipe 管理
+
+            elif "1.0" in ua_value:
+                # 返回 200 OK，保持连接，等待下一个 payload
+                writer.write(FIRST_RESPONSE)
+                await writer.drain()
+                # 如果有剩余数据，丢弃即可
+                continue
+            else:
+                writer.write(FORBIDDEN_RESPONSE)
+                await writer.drain()
+                break
 
     except Exception as e:
-        print(f"Connection error {peer}: {e}")
+        print(f"[!] Connection error {peer}: {e}")
     finally:
-        writer.close()
-        await writer.wait_closed()
-        print(f"Closed {peer}")
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except:
+            pass
+        ACTIVE_CONNS.pop(conn_id, None)
+        print(f"[-] Connection {peer} closed")
 
+# ---------------- 心跳机制 ----------------
+async def heartbeat():
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+        now = time.time()
+        for conn_id, info in list(ACTIVE_CONNS.items()):
+            writer = info['writer']
+            last = info['last_active']
+            if now - last >= HEARTBEAT_INTERVAL:
+                try:
+                    writer.write(b'')
+                    await writer.drain()
+                except:
+                    ACTIVE_CONNS.pop(conn_id, None)
 
+# ---------------- 启动服务 ----------------
 async def main():
-    # TLS server
-    ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_ctx.load_cert_chain(CERT_FILE, KEY_FILE)
 
     tls_server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, tls=True),
@@ -144,24 +231,30 @@ async def main():
         ssl=ssl_ctx
     )
 
-    # HTTP server
     http_server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, tls=False),
         LISTEN_ADDR,
         HTTP_PORT
     )
 
-    print(f"Listening on {LISTEN_ADDR}:{HTTP_PORT} (HTTP payload)")
-    print(f"Listening on {LISTEN_ADDR}:{TLS_PORT} (TLS)")
+    print(f"[+] Listening on {LISTEN_ADDR}:{HTTP_PORT} (HTTP payload)")
+    print(f"[+] Listening on {LISTEN_ADDR}:{TLS_PORT} (TLS)")
 
     async with tls_server, http_server:
         await asyncio.gather(
             tls_server.serve_forever(),
-            http_server.serve_forever()
+            http_server.serve_forever(),
+            heartbeat()
         )
 
+
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nServer stopped manually.")
+    except Exception as e:
+        print(f"[!] Fatal error: {e}")
 
 EOF
 
