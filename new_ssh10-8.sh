@@ -1,6 +1,5 @@
 #!/bin/bash
 set -e
-# 2025-10-08-07-10
 # =============================
 # 提示端口
 # =============================
@@ -35,20 +34,7 @@ sudo tee /usr/local/bin/wss > /dev/null <<'EOF'
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import asyncio
-import ssl
-import re
-import socket
-import time
-import sys
-
-# --- uvloop 加速（若已安装） ---
-try:
-    import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    print("[*] uvloop enabled")
-except Exception:
-    print("[*] uvloop not available, using default asyncio loop")
+import asyncio, ssl, re, socket, time, sys
 
 # ================= 配置 =================
 LISTEN_ADDR = '0.0.0.0'
@@ -77,18 +63,7 @@ def set_socket_options_from_writer(writer: asyncio.StreamWriter):
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
-        except Exception:
-            pass
-        for opt in ('TCP_KEEPIDLE', 'TCP_KEEPINTVL', 'TCP_KEEPCNT'):
-            if hasattr(socket, opt):
-                try:
-                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), 30)
-                except Exception:
-                    pass
-    except Exception:
+    except:
         pass
 
 async def read_until_headers(reader: asyncio.StreamReader, initial_chunk: bytes = b''):
@@ -110,27 +85,22 @@ async def pipe(src_reader: asyncio.StreamReader, dst_writer: asyncio.StreamWrite
             chunk = await src_reader.read(BUFFER_SIZE)
             if not chunk:
                 break
-            try:
-                dst_writer.write(chunk)
-            except Exception:
-                break
+            dst_writer.write(chunk)
             transport = getattr(dst_writer, 'transport', None)
             try:
                 if transport and transport.get_write_buffer_size() > WRITE_BACKPRESSURE:
                     await dst_writer.drain()
-            except Exception:
+            except:
                 break
             if conn_key in ACTIVE_CONNS:
                 ACTIVE_CONNS[conn_key]['last_active'] = time.time()
-    except asyncio.CancelledError:
-        pass
-    except Exception:
+    except:
         pass
     finally:
         try:
             dst_writer.close()
             await dst_writer.wait_closed()
-        except Exception:
+        except:
             pass
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
@@ -138,8 +108,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     conn_key = f"{peer}-{time.time()}"
     ACTIVE_CONNS[conn_key] = {'writer': writer, 'last_active': time.time()}
     set_socket_options_from_writer(writer)
-    print(f"[+] Connection from {peer} {'(TLS)' if tls else ''}")
-
     forwarding_started = False
     target_reader = target_writer = None
     pipe_tasks = []
@@ -149,7 +117,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             initial = await asyncio.wait_for(reader.read(64 * 1024), timeout=TIMEOUT)
             if not initial:
                 break
-
             headers_bytes, rest = await read_until_headers(reader, initial)
             headers_text = headers_bytes.decode(errors='ignore')
 
@@ -179,8 +146,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 try:
                     writer.write(SWITCH_RESPONSE)
                     await writer.drain()
-                except Exception as e:
-                    print(f"[!] Failed to send SWITCH_RESPONSE to {peer}: {e}")
+                except:
                     break
                 forwarding_started = True
             elif "1.0" in ua_value:
@@ -201,10 +167,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             if host_header:
                 if ':' in host_header:
                     host, port = host_header.split(':', 1)
-                    try:
-                        target = (host.strip(), int(port.strip()))
-                    except Exception:
-                        target = DEFAULT_TARGET
+                    target = (host.strip(), int(port.strip()))
                 else:
                     target = (host_header.strip(), 22)
             else:
@@ -212,9 +175,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
             try:
                 target_reader, target_writer = await asyncio.open_connection(*target)
-                set_socket_options_from_writer(target_writer)
-            except Exception as e:
-                print(f"[!] Failed to connect target {target}: {e}")
+            except:
                 try:
                     writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                     await writer.drain()
@@ -222,35 +183,21 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     pass
                 break
 
-            try:
-                if rest:
-                    target_writer.write(rest)
-                    transport = getattr(target_writer, 'transport', None)
-                    if transport and transport.get_write_buffer_size() > WRITE_BACKPRESSURE:
-                        await target_writer.drain()
-            except Exception:
-                pass
-
             t1 = asyncio.create_task(pipe(reader, target_writer, conn_key))
             t2 = asyncio.create_task(pipe(target_reader, writer, conn_key))
             pipe_tasks = [t1, t2]
 
             done, pending = await asyncio.wait(pipe_tasks, return_when=asyncio.FIRST_COMPLETED)
-
             for p in pending:
                 p.cancel()
-            for p in pending:
                 try:
                     await p
                 except:
                     pass
-
             break
 
-    except asyncio.TimeoutError:
-        print(f"[!] initial read timeout from {peer}")
-    except Exception as e:
-        print(f"[!] Connection error {peer}: {e}")
+    except:
+        pass
     finally:
         for t in pipe_tasks:
             if not t.done():
@@ -265,13 +212,12 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         except:
             pass
         try:
-            if 'target_writer' in locals() and target_writer:
+            if target_writer:
                 target_writer.close()
                 await target_writer.wait_closed()
         except:
             pass
         ACTIVE_CONNS.pop(conn_key, None)
-        print(f"[-] Closed {peer}")
 
 async def connection_gc():
     while True:
@@ -280,7 +226,6 @@ async def connection_gc():
             last = info.get('last_active', 0)
             if now - last > IDLE_TIMEOUT:
                 w = info.get('writer')
-                print(f"[*] GC closing idle connection {key}")
                 try:
                     w.close()
                     await w.wait_closed()
@@ -310,37 +255,22 @@ async def main():
     print(f"Listening on {LISTEN_ADDR}:{TLS_PORT} (TLS)")
 
     gc_task = asyncio.create_task(connection_gc())
-
     async with tls_server, http_server:
-        try:
-            await asyncio.gather(
-                tls_server.serve_forever(),
-                http_server.serve_forever(),
-                gc_task
-            )
-        finally:
-            gc_task.cancel()
-            try:
-                await gc_task
-            except:
-                pass
+        await asyncio.gather(
+            tls_server.serve_forever(),
+            http_server.serve_forever(),
+            gc_task
+        )
 
 if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nServer stopped manually.")
-    except Exception as e:
-        print(f"[!] Fatal error: {e}")
+    asyncio.run(main())
 EOF
 
 sudo chmod +x /usr/local/bin/wss
 echo "WSS 脚本安装完成"
 echo "----------------------------------"
 
-# =============================
-# 创建 WSS systemd 服务
-# =============================
+# 创建 systemd 服务
 sudo tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
 Description=WSS Python Proxy
@@ -357,83 +287,59 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl stop wss || true
 sudo systemctl enable wss
 sudo systemctl restart wss
-echo "WSS 已启动，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
+echo "WSS 已启动，HTTP $WSS_HTTP_PORT, TLS $WSS_TLS_PORT"
 echo "----------------------------------"
 
 # =============================
-# 安装 Stunnel4 并生成证书
+# 安装 Stunnel4（替换原报错逻辑） 
 # =============================
 echo "==== 安装 Stunnel4 ===="
 sudo mkdir -p /etc/stunnel/certs
-if [ ! -f /etc/stunnel/certs/stunnel.pem ]; then
-    sudo openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-        -keyout /etc/stunnel/certs/stunnel.key \
-        -out /etc/stunnel/certs/stunnel.crt \
-        -subj "/CN=wss.local"
-    sudo sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
-fi
+sudo openssl req -x509 -nodes -newkey rsa:2048 \
+-keyout /etc/stunnel/certs/stunnel.key \
+-out /etc/stunnel/certs/stunnel.crt \
+-days 1095 \
+-subj "/CN=example.com"
+sudo sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
+sudo chmod 644 /etc/stunnel/certs/*.crt /etc/stunnel/certs/*.pem
 
-sudo chmod 600 /etc/stunnel/certs/stunnel.pem /etc/stunnel/certs/stunnel.key
-sudo chown root:root /etc/stunnel/certs/stunnel.pem /etc/stunnel/certs/stunnel.key
-
-# 创建 Stunnel4 配置
 sudo tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
-pid = /var/run/stunnel4.pid
+pid=/var/run/stunnel.pid
+setuid=root
+setgid=root
 client = no
-foreground = no
-setuid = root
-setgid = root
-cert = /etc/stunnel/certs/stunnel.pem
-key = /etc/stunnel/certs/stunnel.key
+debug = 5
+output = /var/log/stunnel4/stunnel.log
 socket = l:TCP_NODELAY=1
 socket = r:TCP_NODELAY=1
 
 [ssh-tls-gateway]
-accept = $STUNNEL_PORT
+accept = 0.0.0.0:$STUNNEL_PORT
+cert = /etc/stunnel/certs/stunnel.pem
+key = /etc/stunnel/certs/stunnel.pem
 connect = 127.0.0.1:22
 EOF
 
-# 创建 systemd 原生服务管理 stunnel
-sudo tee /etc/systemd/system/stunnel-wss.service > /dev/null <<EOF
-[Unit]
-Description=Stunnel WSS to SSH
-After=network.target
-
-[Service]
-Type=forking
-ExecStart=/usr/bin/stunnel4 /etc/stunnel/ssh-tls.conf
-ExecStop=/bin/kill -TERM \$MAINPID
-PIDFile=/var/run/stunnel4.pid
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable stunnel-wss
-sudo systemctl restart stunnel-wss
-echo "Stunnel4 已启动，监听端口 $STUNNEL_PORT -> 22"
+sudo systemctl enable stunnel4
+sudo systemctl restart stunnel4
+echo "Stunnel4 已启动，端口 $STUNNEL_PORT -> 22"
 echo "----------------------------------"
 
 # =============================
-# 安装 UDPGW (Badvpn)
+# 安装 UDPGW
 # =============================
-echo "==== 安装 UDPGW (Badvpn) ===="
-sudo mkdir -p /root/badvpn
-cd /root/badvpn
-if [ ! -d badvpn ]; then
-    git clone https://github.com/ambrop72/badvpn.git
+echo "==== 安装 UDPGW ===="
+if [ -d "/root/badvpn" ]; then
+    echo "/root/badvpn 已存在，跳过克隆"
+else
+    git clone https://github.com/ambrop72/badvpn.git /root/badvpn
 fi
-cd badvpn
-mkdir -p build
-cd build
+mkdir -p /root/badvpn/badvpn-build
+cd /root/badvpn/badvpn-build
 cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1
 make -j$(nproc)
-sudo cp udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
 
 sudo tee /etc/systemd/system/udpgw.service > /dev/null <<EOF
 [Unit]
@@ -441,7 +347,8 @@ Description=UDP Gateway (Badvpn)
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:$UDPGW_PORT --max-clients 1024
+Type=simple
+ExecStart=/root/badvpn/badvpn-build/udpgw/badvpn-udpgw --listen-addr 127.0.0.1:$UDPGW_PORT --max-clients 1024
 Restart=on-failure
 User=root
 
@@ -450,10 +357,12 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl stop udpgw || true
 sudo systemctl enable udpgw
 sudo systemctl restart udpgw
 echo "UDPGW 已启动，端口 $UDPGW_PORT"
 echo "----------------------------------"
 
-echo "==== 安装完成，所有服务运行正常 ===="
+echo "所有组件安装完成!"
+echo "查看 WSS 状态: sudo systemctl status wss"
+echo "查看 Stunnel4 状态: sudo systemctl status stunnel4"
+echo "查看 UDPGW 状态: sudo systemctl status udpgw"
