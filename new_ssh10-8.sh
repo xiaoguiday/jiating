@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-#2025-10-08-06-39
+#2025-10-08-06-44
 # =============================
 # 提示端口
 # =============================
@@ -368,25 +368,42 @@ echo "----------------------------------"
 # 安装 Stunnel4 并生成证书
 # =============================
 echo "==== 安装 Stunnel4 ===="
+sudo apt install -y stunnel4
+
 sudo mkdir -p /etc/stunnel/certs
 if [ ! -f /etc/stunnel/certs/stunnel.pem ]; then
     sudo openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
         -keyout /etc/stunnel/certs/stunnel.key \
-        -out /etc/stunnel/certs/stunnel.pem \
+        -out /etc/stunnel/certs/stunnel.crt \
         -subj "/CN=wss.local"
+    sudo sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
 fi
 
+sudo chmod 600 /etc/stunnel/certs/stunnel.pem /etc/stunnel/certs/stunnel.key
+sudo chown root:root /etc/stunnel/certs/stunnel.pem /etc/stunnel/certs/stunnel.key
+
+# 创建 Stunnel4 配置
 sudo tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
+pid = /var/run/stunnel4.pid
+client = no
+foreground = no
+setuid = root
+setgid = root
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.key
-pid = /var/run/stunnel4.pid
-[ssh-tls]
+socket = l:TCP_NODELAY=1
+socket = r:TCP_NODELAY=1
+
+[ssh-tls-gateway]
 accept = $STUNNEL_PORT
 connect = 127.0.0.1:$WSS_TLS_PORT
 EOF
 
-sudo systemctl restart stunnel4
-echo "Stunnel4 已启动，监听端口 $STUNNEL_PORT"
+# 使用 systemd 模板服务启动，保证动态端口生效
+sudo systemctl enable stunnel4@ssh-tls-gateway
+sudo systemctl restart stunnel4@ssh-tls-gateway
+
+echo "Stunnel4 已启动，监听端口 $STUNNEL_PORT -> $WSS_TLS_PORT"
 echo "----------------------------------"
 
 # =============================
