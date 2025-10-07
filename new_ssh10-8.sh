@@ -1,6 +1,5 @@
 #!/bin/bash
 set -e
-# 2025-10-08-07-00
 # =============================
 # 提示端口
 # =============================
@@ -242,7 +241,7 @@ echo "WSS 已启动，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
 echo "----------------------------------"
 
 # =============================
-# 安装 Stunnel4 并生成证书（使用 systemd 原生服务）
+# 安装 Stunnel4 并生成证书
 # =============================
 echo "==== 安装 Stunnel4 ===="
 sudo mkdir -p /etc/stunnel/certs
@@ -253,11 +252,11 @@ if [ ! -f /etc/stunnel/certs/stunnel.pem ]; then
         -subj "/CN=wss.local"
     sudo sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
 fi
+
 sudo chmod 600 /etc/stunnel/certs/stunnel.pem /etc/stunnel/certs/stunnel.key
 sudo chown root:root /etc/stunnel/certs/stunnel.pem /etc/stunnel/certs/stunnel.key
 
-# 创建 stunnel 配置
-sudo tee /etc/stunnel/stunnel.conf > /dev/null <<EOF
+sudo tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
 pid = /var/run/stunnel4.pid
 client = no
 foreground = no
@@ -273,26 +272,8 @@ accept = $STUNNEL_PORT
 connect = 127.0.0.1:22
 EOF
 
-# 创建 systemd 原生服务
-sudo tee /etc/systemd/system/stunnel-wss.service > /dev/null <<EOF
-[Unit]
-Description=Stunnel WSS to SSH
-After=network.target
-
-[Service]
-Type=forking
-ExecStart=/usr/bin/stunnel /etc/stunnel/stunnel.conf
-ExecStop=/bin/kill -TERM \$MAINPID
-PIDFile=/var/run/stunnel4.pid
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable stunnel-wss
-sudo systemctl restart stunnel-wss
+sudo systemctl enable stunnel4
+sudo systemctl restart stunnel4
 echo "Stunnel4 已启动，监听端口 $STUNNEL_PORT -> 22"
 echo "----------------------------------"
 
@@ -302,13 +283,13 @@ echo "----------------------------------"
 echo "==== 安装 UDPGW (Badvpn) ===="
 sudo mkdir -p /root/badvpn
 cd /root/badvpn
-if [ ! -f /usr/local/bin/badvpn-udpgw ]; then
+if [ ! -f badvpn-udpgw ]; then
     git clone https://github.com/ambrop72/badvpn.git .
     mkdir -p build
     cd build
     cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1
     make -j$(nproc)
-    sudo cp udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
+    cp udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
 fi
 
 sudo tee /etc/systemd/system/udpgw.service > /dev/null <<EOF
