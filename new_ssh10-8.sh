@@ -1,6 +1,7 @@
 #!/bin/bash
 set -e
-#2025-10-08-08-51
+#2025-10-08-09-15
+
 # =============================
 # 提示端口
 # =============================
@@ -340,7 +341,7 @@ echo "WSS 脚本安装完成"
 echo "----------------------------------"
 
 # =============================
-# 创建 systemd 服务
+# 创建 systemd 服务 (优化版)
 # =============================
 sudo tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
@@ -351,7 +352,11 @@ After=network.target
 Type=simple
 ExecStart=/usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
 Restart=on-failure
+RestartSec=3
 User=root
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
