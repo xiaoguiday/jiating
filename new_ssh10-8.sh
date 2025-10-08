@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+#2025-10-08-08-51
 # =============================
 # 提示端口
 # =============================
@@ -24,8 +25,14 @@ sudo apt install -y python3 python3-pip wget curl git net-tools cmake build-esse
 echo "依赖安装完成"
 echo "----------------------------------"
 
+# 安装 uvloop
+echo "==== 安装 uvloop ===="
+sudo pip3 install uvloop
+echo "uvloop 安装完成"
+echo "----------------------------------"
+
 # =============================
-# 安装 WSS 脚本
+# 安装 WSS 脚本 (支持 uvloop)
 # =============================
 echo "==== 安装 WSS 脚本 ===="
 sudo mkdir -p /usr/local/bin
@@ -34,7 +41,16 @@ sudo tee /usr/local/bin/wss > /dev/null <<'EOF'
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import asyncio, ssl, re, socket, time, sys
+# uvloop 加速（若已安装）
+try:
+    import uvloop, asyncio
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    print("[*] uvloop enabled")
+except Exception:
+    import asyncio
+    print("[*] uvloop not available, using default asyncio loop")
+
+import ssl, re, socket, time, sys
 
 # ================= 配置 =================
 LISTEN_ADDR = '0.0.0.0'
@@ -63,7 +79,18 @@ def set_socket_options_from_writer(writer: asyncio.StreamWriter):
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    except:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
+        except Exception:
+            pass
+        for opt in ('TCP_KEEPIDLE', 'TCP_KEEPINTVL', 'TCP_KEEPCNT'):
+            if hasattr(socket, opt):
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), 30)
+                except Exception:
+                    pass
+    except Exception:
         pass
 
 async def read_until_headers(reader: asyncio.StreamReader, initial_chunk: bytes = b''):
@@ -85,22 +112,27 @@ async def pipe(src_reader: asyncio.StreamReader, dst_writer: asyncio.StreamWrite
             chunk = await src_reader.read(BUFFER_SIZE)
             if not chunk:
                 break
-            dst_writer.write(chunk)
+            try:
+                dst_writer.write(chunk)
+            except Exception:
+                break
             transport = getattr(dst_writer, 'transport', None)
             try:
                 if transport and transport.get_write_buffer_size() > WRITE_BACKPRESSURE:
                     await dst_writer.drain()
-            except:
+            except Exception:
                 break
             if conn_key in ACTIVE_CONNS:
                 ACTIVE_CONNS[conn_key]['last_active'] = time.time()
-    except:
+    except asyncio.CancelledError:
+        pass
+    except Exception:
         pass
     finally:
         try:
             dst_writer.close()
             await dst_writer.wait_closed()
-        except:
+        except Exception:
             pass
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
@@ -108,6 +140,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     conn_key = f"{peer}-{time.time()}"
     ACTIVE_CONNS[conn_key] = {'writer': writer, 'last_active': time.time()}
     set_socket_options_from_writer(writer)
+    print(f"[+] Connection from {peer} {'(TLS)' if tls else ''}")
+
     forwarding_started = False
     target_reader = target_writer = None
     pipe_tasks = []
@@ -117,6 +151,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             initial = await asyncio.wait_for(reader.read(64 * 1024), timeout=TIMEOUT)
             if not initial:
                 break
+
             headers_bytes, rest = await read_until_headers(reader, initial)
             headers_text = headers_bytes.decode(errors='ignore')
 
@@ -146,7 +181,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 try:
                     writer.write(SWITCH_RESPONSE)
                     await writer.drain()
-                except:
+                except Exception as e:
+                    print(f"[!] Failed to send SWITCH_RESPONSE to {peer}: {e}")
                     break
                 forwarding_started = True
             elif "1.0" in ua_value:
@@ -167,7 +203,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             if host_header:
                 if ':' in host_header:
                     host, port = host_header.split(':', 1)
-                    target = (host.strip(), int(port.strip()))
+                    try:
+                        target = (host.strip(), int(port.strip()))
+                    except Exception:
+                        target = DEFAULT_TARGET
                 else:
                     target = (host_header.strip(), 22)
             else:
@@ -175,13 +214,24 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
             try:
                 target_reader, target_writer = await asyncio.open_connection(*target)
-            except:
+                set_socket_options_from_writer(target_writer)
+            except Exception as e:
+                print(f"[!] Failed to connect target {target}: {e}")
                 try:
                     writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                     await writer.drain()
                 except:
                     pass
                 break
+
+            try:
+                if rest:
+                    target_writer.write(rest)
+                    transport = getattr(target_writer, 'transport', None)
+                    if transport and transport.get_write_buffer_size() > WRITE_BACKPRESSURE:
+                        await target_writer.drain()
+            except Exception:
+                pass
 
             t1 = asyncio.create_task(pipe(reader, target_writer, conn_key))
             t2 = asyncio.create_task(pipe(target_reader, writer, conn_key))
@@ -190,14 +240,18 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             done, pending = await asyncio.wait(pipe_tasks, return_when=asyncio.FIRST_COMPLETED)
             for p in pending:
                 p.cancel()
+            for p in pending:
                 try:
                     await p
                 except:
                     pass
+
             break
 
-    except:
-        pass
+    except asyncio.TimeoutError:
+        print(f"[!] initial read timeout from {peer}")
+    except Exception as e:
+        print(f"[!] Connection error {peer}: {e}")
     finally:
         for t in pipe_tasks:
             if not t.done():
@@ -212,12 +266,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         except:
             pass
         try:
-            if target_writer:
+            if 'target_writer' in locals() and target_writer:
                 target_writer.close()
                 await target_writer.wait_closed()
         except:
             pass
         ACTIVE_CONNS.pop(conn_key, None)
+        print(f"[-] Closed {peer}")
 
 async def connection_gc():
     while True:
@@ -226,6 +281,7 @@ async def connection_gc():
             last = info.get('last_active', 0)
             if now - last > IDLE_TIMEOUT:
                 w = info.get('writer')
+                print(f"[*] GC closing idle connection {key}")
                 try:
                     w.close()
                     await w.wait_closed()
@@ -255,22 +311,37 @@ async def main():
     print(f"Listening on {LISTEN_ADDR}:{TLS_PORT} (TLS)")
 
     gc_task = asyncio.create_task(connection_gc())
+
     async with tls_server, http_server:
-        await asyncio.gather(
-            tls_server.serve_forever(),
-            http_server.serve_forever(),
-            gc_task
-        )
+        try:
+            await asyncio.gather(
+                tls_server.serve_forever(),
+                http_server.serve_forever(),
+                gc_task
+            )
+        finally:
+            gc_task.cancel()
+            try:
+                await gc_task
+            except:
+                pass
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nServer stopped manually.")
+    except Exception as e:
+        print(f"[!] Fatal error: {e}")
 EOF
 
 sudo chmod +x /usr/local/bin/wss
 echo "WSS 脚本安装完成"
 echo "----------------------------------"
 
+# =============================
 # 创建 systemd 服务
+# =============================
 sudo tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
 Description=WSS Python Proxy
@@ -293,7 +364,7 @@ echo "WSS 已启动，HTTP $WSS_HTTP_PORT, TLS $WSS_TLS_PORT"
 echo "----------------------------------"
 
 # =============================
-# 安装 Stunnel4（替换原报错逻辑） 
+# 安装 Stunnel4
 # =============================
 echo "==== 安装 Stunnel4 ===="
 sudo mkdir -p /etc/stunnel/certs
@@ -328,7 +399,7 @@ echo "Stunnel4 已启动，端口 $STUNNEL_PORT -> 22"
 echo "----------------------------------"
 
 # =============================
-# 安装 UDPGW
+# 安装 UDPGW (Badvpn)
 # =============================
 echo "==== 安装 UDPGW ===="
 if [ -d "/root/badvpn" ]; then
