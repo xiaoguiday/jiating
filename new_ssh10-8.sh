@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-#2025-10-08-09-15
+#2025-10-08-09-18
 
 # =============================
 # 提示端口
@@ -33,7 +33,7 @@ echo "uvloop 安装完成"
 echo "----------------------------------"
 
 # =============================
-# 安装 WSS 脚本 (支持 uvloop)
+# 安装 WSS 脚本 (完整，支持 uvloop)
 # =============================
 echo "==== 安装 WSS 脚本 ===="
 sudo mkdir -p /usr/local/bin
@@ -42,7 +42,7 @@ sudo tee /usr/local/bin/wss > /dev/null <<'EOF'
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-# uvloop 加速（若已安装）
+# uvloop 加速
 try:
     import uvloop, asyncio
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -81,30 +81,30 @@ def set_socket_options_from_writer(writer: asyncio.StreamWriter):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256*1024)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256*1024)
         except Exception:
             pass
-        for opt in ('TCP_KEEPIDLE', 'TCP_KEEPINTVL', 'TCP_KEEPCNT'):
-            if hasattr(socket, opt):
+        for opt in ('TCP_KEEPIDLE','TCP_KEEPINTVL','TCP_KEEPCNT'):
+            if hasattr(socket,opt):
                 try:
-                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), 30)
+                    sock.setsockopt(socket.IPPROTO_TCP,getattr(socket,opt),30)
                 except Exception:
                     pass
     except Exception:
         pass
 
-async def read_until_headers(reader: asyncio.StreamReader, initial_chunk: bytes = b''):
+async def read_until_headers(reader: asyncio.StreamReader, initial_chunk: bytes=b''):
     data = bytearray(initial_chunk)
     while True:
         if b'\r\n\r\n' in data:
-            headers, rest = data.split(b'\r\n\r\n', 1)
+            headers, rest = data.split(b'\r\n\r\n',1)
             return bytes(headers), bytes(rest)
         chunk = await reader.read(4096)
         if not chunk:
             return bytes(data), b''
         data.extend(chunk)
-        if len(data) > 128 * 1024:
+        if len(data) > 128*1024:
             return bytes(data), b''
 
 async def pipe(src_reader: asyncio.StreamReader, dst_writer: asyncio.StreamWriter, conn_key: str):
@@ -117,7 +117,7 @@ async def pipe(src_reader: asyncio.StreamReader, dst_writer: asyncio.StreamWrite
                 dst_writer.write(chunk)
             except Exception:
                 break
-            transport = getattr(dst_writer, 'transport', None)
+            transport = getattr(dst_writer,'transport',None)
             try:
                 if transport and transport.get_write_buffer_size() > WRITE_BACKPRESSURE:
                     await dst_writer.drain()
@@ -139,7 +139,7 @@ async def pipe(src_reader: asyncio.StreamReader, dst_writer: asyncio.StreamWrite
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
     conn_key = f"{peer}-{time.time()}"
-    ACTIVE_CONNS[conn_key] = {'writer': writer, 'last_active': time.time()}
+    ACTIVE_CONNS[conn_key] = {'writer':writer,'last_active':time.time()}
     set_socket_options_from_writer(writer)
     print(f"[+] Connection from {peer} {'(TLS)' if tls else ''}")
 
@@ -149,7 +149,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
     try:
         while True:
-            initial = await asyncio.wait_for(reader.read(64 * 1024), timeout=TIMEOUT)
+            initial = await asyncio.wait_for(reader.read(64*1024), timeout=TIMEOUT)
             if not initial:
                 break
 
@@ -163,9 +163,9 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 if not l:
                     continue
                 if l.lower().startswith('x-real-host:'):
-                    host_header = l.split(':', 1)[1].strip()
+                    host_header = l.split(':',1)[1].strip()
                 elif l.lower().startswith('x-pass:'):
-                    passwd_header = l.split(':', 1)[1].strip()
+                    passwd_header = l.split(':',1)[1].strip()
 
             if PASS and passwd_header != PASS:
                 try:
@@ -203,7 +203,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
             if host_header:
                 if ':' in host_header:
-                    host, port = host_header.split(':', 1)
+                    host, port = host_header.split(':',1)
                     try:
                         target = (host.strip(), int(port.strip()))
                     except Exception:
@@ -228,15 +228,15 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             try:
                 if rest:
                     target_writer.write(rest)
-                    transport = getattr(target_writer, 'transport', None)
+                    transport = getattr(target_writer,'transport',None)
                     if transport and transport.get_write_buffer_size() > WRITE_BACKPRESSURE:
                         await target_writer.drain()
             except Exception:
                 pass
 
-            t1 = asyncio.create_task(pipe(reader, target_writer, conn_key))
-            t2 = asyncio.create_task(pipe(target_reader, writer, conn_key))
-            pipe_tasks = [t1, t2]
+            t1 = asyncio.create_task(pipe(reader,target_writer,conn_key))
+            t2 = asyncio.create_task(pipe(target_reader,writer,conn_key))
+            pipe_tasks = [t1,t2]
 
             done, pending = await asyncio.wait(pipe_tasks, return_when=asyncio.FIRST_COMPLETED)
             for p in pending:
@@ -272,14 +272,14 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 await target_writer.wait_closed()
         except:
             pass
-        ACTIVE_CONNS.pop(conn_key, None)
+        ACTIVE_CONNS.pop(conn_key,None)
         print(f"[-] Closed {peer}")
 
 async def connection_gc():
     while True:
         now = time.time()
         for key, info in list(ACTIVE_CONNS.items()):
-            last = info.get('last_active', 0)
+            last = info.get('last_active',0)
             if now - last > IDLE_TIMEOUT:
                 w = info.get('writer')
                 print(f"[*] GC closing idle connection {key}")
@@ -288,22 +288,22 @@ async def connection_gc():
                     await w.wait_closed()
                 except:
                     pass
-                ACTIVE_CONNS.pop(key, None)
-        await asyncio.sleep(IDLE_TIMEOUT // 2 or 30)
+                ACTIVE_CONNS.pop(key,None)
+        await asyncio.sleep(IDLE_TIMEOUT//2 or 30)
 
 async def main():
     ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
+    ssl_ctx.load_cert_chain(certfile=CERT_FILE,keyfile=KEY_FILE)
 
     tls_server = await asyncio.start_server(
-        lambda r, w: handle_client(r, w, tls=True),
+        lambda r,w: handle_client(r,w,tls=True),
         LISTEN_ADDR,
         TLS_PORT,
         ssl=ssl_ctx
     )
 
     http_server = await asyncio.start_server(
-        lambda r, w: handle_client(r, w, tls=False),
+        lambda r,w: handle_client(r,w,tls=False),
         LISTEN_ADDR,
         HTTP_PORT
     )
@@ -341,7 +341,7 @@ echo "WSS 脚本安装完成"
 echo "----------------------------------"
 
 # =============================
-# 创建 systemd 服务 (优化版)
+# 创建 systemd 服务 (稳定版)
 # =============================
 sudo tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
@@ -350,10 +350,11 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
-Restart=on-failure
-RestartSec=3
 User=root
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
+Restart=always
+RestartSec=3
 StandardOutput=journal
 StandardError=journal
 LimitNOFILE=65535
